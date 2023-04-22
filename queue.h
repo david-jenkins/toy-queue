@@ -20,10 +20,14 @@ typedef struct __shared_info__ {
   // sequence number of last written message
   size_t tail_seq;
   
+  size_t last_tail_seq;
+  size_t last_head;
+  
   // synchronization primitives
   cv_t readable;
   cv_t writeable;
-  mutex_t lock;
+  mutex_t read_lock;
+  mutex_t write_lock;
 } shared_t;
 
 /** Blocking queue data structure
@@ -44,7 +48,7 @@ typedef struct __queue_t__ {
  */
 void queue_init(queue_t *q, char *name, size_t s);
 
-void queue_open(queue_t *q, char *name);
+int queue_open(queue_t *q, char *name);
 
 
 void queue_close(queue_t *q);
@@ -66,6 +70,9 @@ void queue_put(queue_t *q, uint8_t *buffer, size_t size);
   *
   * Returns the number of bytes in the written message.
   */
-size_t queue_get(queue_t *q, uint8_t *buffer, size_t max);
+size_t queue_get(queue_t *q, uint8_t **buffer);
+
+size_t queue_get_last(queue_t *q, uint8_t **buffer);
+
 
 #endif

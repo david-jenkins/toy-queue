@@ -8,6 +8,8 @@
 typedef struct __message_t__ {
     size_t  len;
     size_t  seq;
+    size_t  miss;
+    size_t  padd;
 } message_t;
 
 #endif

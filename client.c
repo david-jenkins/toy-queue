@@ -8,6 +8,8 @@
 #define NUM_THREADS (1)
 #define MESSAGES_PER_THREAD (getpagesize() * 2)
 
+#define ENTRY_SIZE 1600*1096
+#define NSEC_PER_SEC 1000000000
 
 int go = 1;
 
@@ -26,11 +28,38 @@ void *consumer_loop(void *arg) {
     size_t count = 0;
     // size_t i;
     // for(i = 0; i < MESSAGES_PER_THREAD; i++){
-    while(go){
-        size_t x;
-        queue_get(q, (uint8_t *) &x, sizeof(size_t));
-        printf("got %d\n",(int)x);
+    char *buffer;
+    buffer = malloc(ENTRY_SIZE);
+    struct timespec *to;
+    double d0;
+    double d1;
+    to = (struct timespec *)buffer;
+    struct timespec t1;
+    while(go) {
+        #ifdef TELEM
+        queue_get(q, (uint8_t *) buffer, ENTRY_SIZE);
+        clock_gettime(CLOCK_REALTIME, &t1);
+        // printf("got %d\n",to->tv_sec);
+        // printf("got %d\n",to->tv_nsec);
+        printf("%lld.%.9ld\n", (long long)to->tv_sec, to->tv_nsec);
+        d0 = ((double)(to->tv_sec) + ((double)(to->tv_nsec) / NSEC_PER_SEC));
+        d1 = ((double)(t1.tv_sec) + ((double)(t1.tv_nsec) / NSEC_PER_SEC));
+        printf("%e\n",d1-d0);
+        // usleep(80000);
+        #else
+        queue_get_last(q, (uint8_t *) buffer, ENTRY_SIZE);
+        clock_gettime(CLOCK_REALTIME, &t1);
+        // printf("got %d\n",to->tv_sec);
+        // printf("got %d\n",to->tv_nsec);
+        printf("%lld.%.9ld\n", (long long)to->tv_sec, to->tv_nsec);
+        d0 = ((double)(to->tv_sec) + ((double)(to->tv_nsec) / NSEC_PER_SEC));
+        d1 = ((double)(t1.tv_sec) + ((double)(t1.tv_nsec) / NSEC_PER_SEC));
+        printf("%e\n",d1-d0);
+        // usleep(40000);
+        #endif
+        
         count++;
+        
     }
     return (void *) count;
 }

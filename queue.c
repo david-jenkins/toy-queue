@@ -45,6 +45,11 @@ static inline void queue_error_errno(const char *fmt, ...) {
     exit(0);
 }
 
+// union {
+//     message_t *m;
+//     char 
+// }
+
 void queue_init(queue_t *q, char *name, size_t s) {
 
     /* We're going to use a trick where we mmap two adjacent pages (in virtual memory) that point to the
@@ -58,10 +63,14 @@ void queue_init(queue_t *q, char *name, size_t s) {
     if(s % getpagesize() != 0) {
         queue_error("Requested size (%lu) is not a multiple of the page size (%d)", s, getpagesize());
     }
+    
+    // check if shared memory region already exists
+    
 
     // Create an anonymous file backed by memory
     // if((q->fd = memfd_create("queue_region", 0)) == -1){
-    if((q->fd = shm_open(name, O_RDWR|O_CREAT, 0777)) == -1){
+    // open a shared memory region
+    if((q->fd = shm_open(name, O_RDWR|O_CREAT|O_EXCL, 0777)) == -1){
         queue_error_errno("Could not obtain anonymous file");
     }
     
@@ -98,9 +107,13 @@ void queue_init(queue_t *q, char *name, size_t s) {
     pthread_condattr_setpshared(&cattr, PTHREAD_PROCESS_SHARED);
     
     // Initialize synchronization primitives
-    if(mutex_init(&q->queue_info->lock, &att) != 0){
+    if(mutex_init(&q->queue_info->write_lock, &att) != 0){
         queue_error_errno("Could not initialize mutex");
     }
+    if(mutex_init(&q->queue_info->read_lock, &att) != 0){
+        queue_error_errno("Could not initialize mutex");
+    }
+    
     if(cond_init(&q->queue_info->readable, &cattr) != 0){
         queue_error_errno("Could not initialize condition variable");
     }
@@ -115,15 +128,18 @@ void queue_init(queue_t *q, char *name, size_t s) {
     q->queue_info->tail = 0;
     q->queue_info->head_seq = 0;
     q->queue_info->tail_seq = 0;
+    q->queue_info->last_tail_seq = 0;
+    q->queue_info->last_head = 0;
     
     pthread_condattr_destroy(&cattr);
     pthread_mutexattr_destroy(&att);
     
 }
 
-void queue_open(queue_t *q, char *name) {
+int queue_open(queue_t *q, char *name) {
     if((q->fd = shm_open(name, O_RDWR, 0777)) == -1){
-        queue_error_errno("Could not obtain anonymous file");
+        printf("Could not obtain anonymous file\n");
+        return 1;
     }
     
     if((q->queue_info = mmap(NULL, getpagesize(), PROT_READ | PROT_WRITE, MAP_SHARED, q->fd, 0)) == MAP_FAILED){
@@ -147,7 +163,8 @@ void queue_open(queue_t *q, char *name) {
     if(mmap(q->buffer + q->size, q->size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, q->fd, getpagesize()) == MAP_FAILED){
         queue_error_errno("Could not map buffer into virtual memory 3");
     }
-
+    
+    return 0;
 }
 
 void queue_close(queue_t *q) {
@@ -177,7 +194,10 @@ void queue_destroy(queue_t *q) {
         queue_error_errno("Could not unmap buffer");
     }
     
-    if(mutex_destroy(&q->queue_info->lock) != 0){
+    if(mutex_destroy(&q->queue_info->write_lock) != 0){
+        queue_error_errno("Could not destroy mutex");
+    }
+    if(mutex_destroy(&q->queue_info->read_lock) != 0){
         queue_error_errno("Could not destroy mutex");
     }
     
@@ -202,58 +222,130 @@ void queue_destroy(queue_t *q) {
 }
 
 void queue_put(queue_t *q, uint8_t *buffer, size_t size) {
-    mutex_lock(&q->queue_info->lock);
+    mutex_lock(&q->queue_info->write_lock);
     
-    // Wait for space to become available
-    while(q->queue_info->size - (q->queue_info->tail - q->queue_info->head) < size + sizeof(message_t)) {
-        cond_wait(&q->queue_info->writeable, &q->queue_info->lock);
+    message_t m;
+    
+    if (q->queue_info->last_tail_seq < q->queue_info->tail_seq) {
+        // printf("slow consumer...\n");
+        memcpy(&m, &q->buffer[q->queue_info->last_head], sizeof(message_t));
+        m.miss=1;
+        memcpy(&q->buffer[q->queue_info->last_head], &m, sizeof(message_t));
+        q->queue_info->tail  += m.len + sizeof(message_t);
+        cond_signal(&q->queue_info->writeable);
+        // how to notify
+    }
+    
+    
+    // Check if buffer is full
+    if (q->queue_info->size - (q->queue_info->tail - q->queue_info->head) < size + sizeof(message_t)) {
+
+        // printf("buffer overan, overwriting...\n");
+        memcpy(&m, &q->buffer[q->queue_info->head], sizeof(message_t));
+        q->queue_info->head += m.len + sizeof(message_t);
+        q->queue_info->head_seq++;
+        
+        // When read buffer moves into 2nd memory region, we can reset to the 1st region
+        if(q->queue_info->head >= q->queue_info->size) {
+            q->queue_info->head -= q->queue_info->size;
+            q->queue_info->tail -= q->queue_info->size;
+        }
     }
     
     // Construct header
-    message_t m;
+    // message_t m;
     m.len = size;
     m.seq = q->queue_info->tail_seq++;
+    m.miss = 0;
     
     // Write message
     memcpy(&q->buffer[q->queue_info->tail                    ], &m,     sizeof(message_t));
     memcpy(&q->buffer[q->queue_info->tail + sizeof(message_t)], buffer, size             );
     
     // Increment write index
-    q->queue_info->tail  += size + sizeof(message_t);
+    q->queue_info->last_head = q->queue_info->tail;
+    // q->queue_info->tail  += size + sizeof(message_t);
     
     cond_signal(&q->queue_info->readable);
-    mutex_unlock(&q->queue_info->lock);
+    mutex_unlock(&q->queue_info->write_lock);
 }
 
-size_t queue_get(queue_t *q, uint8_t *buffer, size_t max) {
-    mutex_lock(&q->queue_info->lock);
+size_t queue_get_last(queue_t *q, uint8_t **buffer) {
     
-    // Wait for a message that we can successfully consume to reach the front of the queue
+    struct timespec to;
+    to.tv_sec = 2;
     message_t m;
-    for(;;) {
     
-        // Wait for a message to arrive
-        while((q->queue_info->tail - q->queue_info->head) == 0){
-            cond_wait(&q->queue_info->readable, &q->queue_info->lock);
+    mutex_lock(&q->queue_info->write_lock);
+    
+    while (q->queue_info->last_tail_seq==q->queue_info->tail_seq) {
+        if(cond_timedwait(&q->queue_info->readable, &q->queue_info->write_lock, &to)==ETIMEDOUT) {
+            printf("timeout in get\n");
+            mutex_unlock(&q->queue_info->write_lock);
+            return 0;
         }
+    }
+    
+    if (q->queue_info->tail_seq!=q->queue_info->last_tail_seq+1) {
+        printf("missed buffer...\n");
+    }
+    
+    memcpy(&m, &q->buffer[q->queue_info->last_head], sizeof(message_t));
+    // memcpy(buffer, &q->buffer[q->queue_info->last_head + sizeof(message_t)], m.len);
+    *buffer = &q->buffer[q->queue_info->last_head + sizeof(message_t)];
+    q->queue_info->last_tail_seq = q->queue_info->tail_seq;
+    q->queue_info->tail  += m.len + sizeof(message_t);
+    cond_signal(&q->queue_info->writeable);
+    mutex_unlock(&q->queue_info->write_lock);
+    return m.len;
+}
+
+size_t queue_get(queue_t *q, uint8_t **buffer) {
+    
+    struct timespec to;
+    to.tv_sec = 2;
+    message_t m;
+    
+    mutex_lock(&q->queue_info->read_lock);
+
+    // Wait for a message that we can successfully consume to reach the front of the queue
+    // for(;;) {
+        // Wait for a message to arrive
+    while((q->queue_info->tail - q->queue_info->head) == 0){
+        if(cond_timedwait(&q->queue_info->writeable, &q->queue_info->read_lock, &to)==ETIMEDOUT) {
+            printf("timeout in get\n");
+            mutex_unlock(&q->queue_info->read_lock);
+            return 0;
+        }
+    }
         
-        // Read message header
-        memcpy(&m, &q->buffer[q->queue_info->head], sizeof(message_t));
+        // // Read message header
+        // memcpy(&m, &q->buffer[q->queue_info->head], sizeof(message_t));
         
         // Message too long, wait for someone else to consume it
-        if(m.len > max){
-            while(q->queue_info->head_seq == m.seq) {
-                cond_wait(&q->queue_info->writeable, &q->queue_info->lock);
-            }
-            continue;
-        }
+        // if(m.len > max){
+        //     printf("buffer received too long... waiting for a shorter one...\n");
+        //     while(q->queue_info->head_seq == m.seq) {
+        //         if(cond_timedwait(&q->queue_info->readable, &q->queue_info->read_lock, &to)==ETIMEDOUT) {
+        //             printf("timeout in get part 2\n");
+        //             mutex_unlock(&q->queue_info->read_lock);
+        //             return 0;
+        //         }
+        //     }
+        //     continue;
+        // }
         
         // We successfully consumed the header of a suitable message, so proceed
-        break;
-    } 
-    
+    //     break;
+    // } 
+    // Read message header
+    memcpy(&m, &q->buffer[q->queue_info->head], sizeof(message_t));
+    if (m.miss == 1) {
+        printf("Frame %zu was missed...\n",m.seq);
+    }
     // Read message body
-    memcpy(buffer, &q->buffer[q->queue_info->head + sizeof(message_t)], m.len);
+    // memcpy(buffer, &q->buffer[q->queue_info->head + sizeof(message_t)], m.len);
+    *buffer = &q->buffer[q->queue_info->head + sizeof(message_t)];
     
     // Consume the message by incrementing the read pointer
     q->queue_info->head += m.len + sizeof(message_t);
@@ -266,7 +358,7 @@ size_t queue_get(queue_t *q, uint8_t *buffer, size_t max) {
     }
     
     cond_signal(&q->queue_info->writeable);
-    mutex_unlock(&q->queue_info->lock);
+    mutex_unlock(&q->queue_info->read_lock);
     
     return m.len;
 }
