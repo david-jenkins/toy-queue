@@ -1,5 +1,5 @@
-CCFLAGS=-Wall -Wpedantic -Werror -std=gnu11 -finline-functions -fsanitize=address -D_GNU_SOURCE -lrt -lpthread
-LDFLAGS= -lasan
+CCFLAGS=-ggdb -O3 -Wall -Wpedantic -Werror -std=gnu11 -finline-functions -fsanitize=address -D_GNU_SOURCE -lrt -lm -lpthread
+LDFLAGS=-lasan
 
 all: test client client2
 

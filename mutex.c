@@ -1,9 +1,9 @@
 
 #include "mutex.h"
 
-#ifdef OPTMUTEX
-
-int mutex_init(mutex_t *m, const pthread_mutexattr_t *a)
+#ifndef POSIXMUTEX
+// optimised mutexes and conditions
+int mutex_init_v2(mutex_t *m, const pthread_mutexattr_t *a)
 {
 	m->m.u = 0;
 	m->id = rand();
@@ -19,14 +19,94 @@ int mutex_init(mutex_t *m, const pthread_mutexattr_t *a)
 	return 0;
 }
 
-int mutex_destroy(mutex_t *m)
+int mutex_destroy_v2(mutex_t *m)
 {
 	/* Do nothing */
 	(void) m;
 	return 0;
 }
 
-int cond_init(cv_t *c, pthread_condattr_t *a)
+// int mutex_lock_v2(mutex_t *m)
+// {
+// 	int i;
+
+// 	/* Try to grab lock */
+// 	for (i = 0; i < 100; i++)
+// 	{
+// 		if (!xchg_8(&m->m.b.locked, 1)) return 0;
+
+// 		cpu_relax();
+// 	}
+
+// 	/* Have to sleep */
+// 	while (xchg_32(&m->m.u, 257) & 1)
+// 	{
+// 		sys_futex(&m->m, FUTEX_WAIT | m->flags, 257, NULL, NULL, 0);
+// 	}
+
+// 	return 0;
+// }
+
+// int mutex_timedlock_v2(mutex_t *m, const struct timespec *to)
+// {
+// 	int i;
+
+// 	/* Try to grab lock */
+// 	for (i = 0; i < 100; i++)
+// 	{
+// 		if (!xchg_8(&m->m.b.locked, 1)) return 0;
+
+// 		cpu_relax();
+// 	}
+// 	int retval = 0;
+// 	/* Have to sleep */
+// 	while ((xchg_32(&m->m.u, 257) & 1) && retval==0)
+// 	{
+// 		retval = sys_futex(&m->m, FUTEX_WAIT | m->flags, 257, to, NULL, 0);
+// 	}
+// 	if (retval == -1 && errno == ETIMEDOUT)
+// 		retval = ETIMEDOUT;
+
+// 	return retval;
+// }
+
+// int mutex_unlock_v2(mutex_t *m)
+// {
+// 	int i;
+
+// 	/* Locked and not contended */
+// 	if ((m->m.u == 1) && (cmpxchg(&m->m.u, 1, 0) == 1)) return 0;
+
+// 	/* Unlock */
+// 	m->m.b.locked = 0;
+
+// 	barrier();
+
+// 	/* Spin and hope someone takes the lock */
+// 	for (i = 0; i < 200; i++)
+// 	{
+// 		if (m->m.b.locked) return 0;
+
+// 		cpu_relax();
+// 	}
+
+// 	/* We need to wake someone up */
+// 	m->m.b.contended = 0;
+
+// 	sys_futex(&m->m, FUTEX_WAKE | m->flags, 1, NULL, NULL, 0);
+
+// 	return 0;
+// }
+
+// int mutex_trylock_v2(mutex_t *m)
+// {
+// 	/* Try to take the lock, if is currently unlocked */
+// 	unsigned c = xchg_8(&m->m.b.locked, 1);
+// 	if (!c) return 0;
+// 	return EBUSY;
+// }
+
+int cond_init_v2(cv_t *c, pthread_condattr_t *a)
 {
 	c->bcast = 0;
 	c->mid = -1;
@@ -46,16 +126,59 @@ int cond_init(cv_t *c, pthread_condattr_t *a)
 	return 0;
 }
 
-int cond_destroy(cv_t *c)
+int cond_destroy_v2(cv_t *c)
 {
 	/* No need to do anything */
 	(void) c;
 	return 0;
 }
 
-#else
+// int cond_timedwait_v2(cv_t *c, mutex_t *m, const struct timespec *to)
+// {
+// 	int seq = c->seq;
+// 	int retval = 0;
+// 	if (c->mid != m->id)
+// 	{
+// 		if (c->flags!=m->flags) return EINVAL;
+// 		if (c->mid!=-1) return EINVAL;
+// 		/* Atomically set mutex inside cv */
+// 		cmpxchg(&c->mid, -1, m->id);
+// 		if (c->mid != m->id) return EINVAL;
+// 	}
 
-int mutex_init(mutex_t *m, const pthread_mutexattr_t *a)
+// 	mutex_unlock(m);
+
+// 	retval = sys_futex(&c->seq, FUTEX_WAIT | c->flags, seq, to, NULL, 0);
+// 	// if (retval == -1 && errno == ETIMEDOUT) {
+// 	// 	retval = ETIMEDOUT;
+// 	// 	printf("TIMEDOUT in cond_timedwait\n");
+// 	// }
+
+// 	while (xchg_32(&m->m.b.locked, 257) & 1)
+// 	{
+// 		retval = sys_futex(&m->m, FUTEX_WAIT | m->flags, 257, NULL, NULL, 0);
+// 		// if (retval==-1) {
+// 		// 	perror("ERROR in cond_timedwait1: ");
+// 		// }
+// 	}
+
+// 	if (retval==0 && xchg_32(&c->bcast,0) == 1) {
+// 		int seq = c->seq;
+// 		retval = sys_futex(&c->seq, FUTEX_CMP_REQUEUE | c->flags, 0, (void *) INT_MAX, &m->m, seq);
+// 		// if (retval==-1) {
+// 		// 	perror("ERROR in cond_timedwait2: ");
+// 		// }
+// 		c->mid = -1;
+// 	}
+	
+// 	if (retval == -1 && errno == ETIMEDOUT)
+// 		retval = ETIMEDOUT;
+
+// 	return retval;
+// }
+
+// original mutexes and conditions
+int mutex_init_v1(mutex_t *m, const pthread_mutexattr_t *a)
 {
 	m->m.u = 0;
 	m->id = rand();
@@ -71,7 +194,7 @@ int mutex_init(mutex_t *m, const pthread_mutexattr_t *a)
 	return 0;
 }
 
-int mutex_destroy(mutex_t *m)
+int mutex_destroy_v1(mutex_t *m)
 {
 	/* Do nothing */
 	(void) m;
@@ -80,7 +203,7 @@ int mutex_destroy(mutex_t *m)
 
 
 
-int cond_init(cv_t *c, pthread_condattr_t *a)
+int cond_init_v1(cv_t *c, pthread_condattr_t *a)
 {
 	c->bcast = 0;
 	c->mid = -1;
@@ -100,7 +223,7 @@ int cond_init(cv_t *c, pthread_condattr_t *a)
 	return 0;
 }
 
-int cond_destroy(cv_t *c)
+int cond_destroy_v1(cv_t *c)
 {
 	/* No need to do anything */
 	(void) c;

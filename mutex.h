@@ -5,7 +5,8 @@
 
 /* The custom mutexes are mainly used in the darc_condwait* calls
    they can also be used to replace darc_mutex* */
-#define OPTMUTEX
+// #define OPTMUTEX
+#define POSIXMUTEX
 /* OPTMUTEX is for optimised mutexes/conds which are more complex than the standard
    ones but could provide better performance
    the default is a less complicated futex based mutex/cond */
@@ -82,7 +83,7 @@ static inline int sys_futex(void *addr1, int op, int val1, const void *timeout, 
 	return syscall(SYS_futex, addr1, op, val1, timeout, addr2, val3);
 }
 
-typedef struct mutex_s mutex_t;
+// typedef struct mutex_s mutex_t;
 typedef union mutex_u mutex_u;
 
 union mutex_u
@@ -98,18 +99,18 @@ union mutex_u
 struct mutex_s
 {
 	union mutex_u m;
-	unsigned flags;
-	int id;
-	unsigned pad;
+	volatile unsigned flags;
+	volatile int id;
+	volatile unsigned pad;
 };
 
-typedef struct cv cv_t;
+// typedef struct cv cv_t;
 struct cv
 {
-	int mid;
+	volatile int mid;
 	unsigned seq;
 	unsigned bcast;
-	unsigned flags;
+	volatile unsigned flags;
 };
 
 typedef struct spincond_t spincond_t;
@@ -119,18 +120,73 @@ struct spincond_t
 	unsigned bcast;
 };
 
+
+#ifdef POSIXMUTEX
+#define mutex_t pthread_mutex_t 
+#define cv_t pthread_cond_t
+#else
+typedef struct mutex_s mutex_t;
+typedef struct cv cv_t;
+#endif
+
 /*  The initialisation functions are defined and compiled in mutex.c
 	The time critical functions are defined static inline here */
 
-int mutex_init(mutex_t *m, const pthread_mutexattr_t *a);
+int mutex_init_v2(mutex_t *m, const pthread_mutexattr_t *a);
 
-int mutex_destroy(mutex_t *m);
+int mutex_destroy_v2(mutex_t *m);
 
-int cond_init(cv_t *c, pthread_condattr_t *a);
+// int mutex_lock_v2(mutex_t *m);
 
-int cond_destroy(cv_t *c);
+// int mutex_timedlock_v2(mutex_t *m, const struct timespec *to);
 
-#ifdef OPTMUTEX
+// int mutex_unlock_v2(mutex_t *m);
+
+// int mutex_trylock_v2(mutex_t *m);
+
+int cond_init_v2(cv_t *c, pthread_condattr_t *a);
+
+int cond_destroy_v2(cv_t *c);
+
+// int cond_timedwait_v2(cv_t *c, mutex_t *m, const struct timespec *to);
+
+int mutex_init_v1(mutex_t *m, const pthread_mutexattr_t *a);
+
+int mutex_destroy_v1(mutex_t *m);
+
+int cond_init_v1(cv_t *c, pthread_condattr_t *a);
+
+int cond_destroy_v1(cv_t *c);
+
+#ifdef POSIXMUTEX
+
+// #define mutex_t pthread_mutex_t 
+#define mutex_init pthread_mutex_init
+#define mutex_destroy pthread_mutex_destroy
+#define mutex_lock pthread_mutex_lock
+#define mutex_unlock pthread_mutex_unlock
+#define mutex_trylock pthread_mutex_trylock
+
+// #define cv_t pthread_cond_t
+#define cond_init pthread_cond_init
+#define cond_destroy pthread_cond_destroy
+#define cond_wait pthread_cond_wait
+#define cond_timedwait pthread_cond_timedwait
+#define cond_signal pthread_cond_signal
+#define cond_broadcast pthread_cond_broadcast
+
+#elif defined OPTMUTEX
+
+#define mutex_init mutex_init_v2
+#define mutex_destroy mutex_destroy_v2
+// #define mutex_lock mutex_lock_v2
+// #define mutex_timedlock mutex_timedlock_v2
+// #define mutex_unlock mutex_unlock_v2
+// #define mutex_trylock mutex_trylock_v2
+
+#define cond_init cond_init_v2
+#define cond_destroy cond_destroy_v2
+#define cond_timedwait cond_timedwait_v2
 
 static inline int mutex_lock(mutex_t *m)
 {
@@ -212,6 +268,130 @@ static inline int mutex_trylock(mutex_t *m)
 	return EBUSY;
 }
 
+static inline int cond_timedwait(cv_t *c, mutex_t *m, const struct timespec *to)
+{
+	int seq = c->seq;
+	int retval = 0;
+	if (c->mid != m->id)
+	{
+		if (c->flags!=m->flags) return EINVAL;
+		if (c->mid!=-1) return EINVAL;
+		/* Atomically set mutex inside cv */
+		cmpxchg(&c->mid, -1, m->id);
+		if (c->mid != m->id) return EINVAL;
+	}
+
+	mutex_unlock(m);
+
+	retval = sys_futex(&c->seq, FUTEX_WAIT | c->flags, seq, to, NULL, 0);
+	// if (retval == -1 && errno == ETIMEDOUT) {
+	// 	retval = ETIMEDOUT;
+	// 	printf("TIMEDOUT in cond_timedwait\n");
+	// }
+
+	while (xchg_32(&m->m.b.locked, 257) & 1)
+	{
+		retval = sys_futex(&m->m, FUTEX_WAIT | m->flags, 257, NULL, NULL, 0);
+		// if (retval==-1) {
+		// 	perror("ERROR in cond_timedwait1: ");
+		// }
+	}
+
+	if (retval==0 && xchg_32(&c->bcast,0) == 1) {
+		int seq = c->seq;
+		retval = sys_futex(&c->seq, FUTEX_CMP_REQUEUE | c->flags, 0, (void *) INT_MAX, &m->m, seq);
+		// if (retval==-1) {
+		// 	perror("ERROR in cond_timedwait2: ");
+		// }
+		c->mid = -1;
+	}
+	
+	if (retval == -1 && errno == ETIMEDOUT)
+		retval = ETIMEDOUT;
+
+	return retval;
+}
+
+// static inline int mutex_lock(mutex_t *m)
+// {
+// 	int i;
+
+// 	/* Try to grab lock */
+// 	for (i = 0; i < 100; i++)
+// 	{
+// 		if (!xchg_8(&m->m.b.locked, 1)) return 0;
+
+// 		cpu_relax();
+// 	}
+
+// 	/* Have to sleep */
+// 	while (xchg_32(&m->m.u, 257) & 1)
+// 	{
+// 		sys_futex(&m->m, FUTEX_WAIT | m->flags, 257, NULL, NULL, 0);
+// 	}
+
+// 	return 0;
+// }
+
+// static inline int mutex_timedlock(mutex_t *m, const struct timespec *to)
+// {
+// 	int i;
+
+// 	/* Try to grab lock */
+// 	for (i = 0; i < 100; i++)
+// 	{
+// 		if (!xchg_8(&m->m.b.locked, 1)) return 0;
+
+// 		cpu_relax();
+// 	}
+// 	int retval = 0;
+// 	/* Have to sleep */
+// 	while ((xchg_32(&m->m.u, 257) & 1) && retval==0)
+// 	{
+// 		retval = sys_futex(&m->m, FUTEX_WAIT | m->flags, 257, to, NULL, 0);
+// 	}
+// 	if (retval == -1 && errno == ETIMEDOUT)
+// 		retval = ETIMEDOUT;
+
+// 	return retval;
+// }
+
+// static inline int mutex_unlock(mutex_t *m)
+// {
+// 	int i;
+
+// 	/* Locked and not contended */
+// 	if ((m->m.u == 1) && (cmpxchg(&m->m.u, 1, 0) == 1)) return 0;
+
+// 	/* Unlock */
+// 	m->m.b.locked = 0;
+
+// 	barrier();
+
+// 	/* Spin and hope someone takes the lock */
+// 	for (i = 0; i < 200; i++)
+// 	{
+// 		if (m->m.b.locked) return 0;
+
+// 		cpu_relax();
+// 	}
+
+// 	/* We need to wake someone up */
+// 	m->m.b.contended = 0;
+
+// 	sys_futex(&m->m, FUTEX_WAKE | m->flags, 1, NULL, NULL, 0);
+
+// 	return 0;
+// }
+
+// static inline int mutex_trylock(mutex_t *m)
+// {
+// 	/* Try to take the lock, if is currently unlocked */
+// 	unsigned c = xchg_8(&m->m.b.locked, 1);
+// 	if (!c) return 0;
+// 	return EBUSY;
+// }
+
 static inline int cond_signal(cv_t *c)
 {
 	/* We are waking someone up */
@@ -267,40 +447,58 @@ static inline int cond_wait(cv_t *c, mutex_t *m)
 	return 0;
 }
 
-static inline int cond_timedwait(cv_t *c, mutex_t *m, const struct timespec *to)
-{
-	int seq = c->seq;
+// static inline int cond_timedwait(cv_t *c, mutex_t *m, const struct timespec *to)
+// {
+// 	int seq = c->seq;
+// 	int retval = 0;
+// 	if (c->mid != m->id)
+// 	{
+// 		if (c->flags!=m->flags) return EINVAL;
+// 		if (c->mid!=-1) return EINVAL;
+// 		/* Atomically set mutex inside cv */
+// 		cmpxchg(&c->mid, -1, m->id);
+// 		if (c->mid != m->id) return EINVAL;
+// 	}
 
-	if (c->mid != m->id)
-	{
-		if (c->flags!=m->flags) return EINVAL;
-		if (c->mid!=-1) return EINVAL;
-		/* Atomically set mutex inside cv */
-		cmpxchg(&c->mid, -1, m->id);
-		if (c->mid != m->id) return EINVAL;
-	}
+// 	mutex_unlock(m);
 
-	mutex_unlock(m);
+// 	retval = sys_futex(&c->seq, FUTEX_WAIT | c->flags, seq, to, NULL, 0);
+// 	// if (retval == -1 && errno == ETIMEDOUT) {
+// 	// 	retval = ETIMEDOUT;
+// 	// 	printf("TIMEDOUT in cond_timedwait\n");
+// 	// }
 
-	int retval = sys_futex(&c->seq, FUTEX_WAIT | c->flags, seq, to, NULL, 0);
-	if (retval == -1 && errno == ETIMEDOUT)
-		retval = ETIMEDOUT;
+// 	while (xchg_32(&m->m.b.locked, 257) & 1)
+// 	{
+// 		retval = sys_futex(&m->m, FUTEX_WAIT | m->flags, 257, NULL, NULL, 0);
+// 		// if (retval==-1) {
+// 		// 	perror("ERROR in cond_timedwait1: ");
+// 		// }
+// 	}
 
-	while (xchg_32(&m->m.b.locked, 257) & 1)
-	{
-		sys_futex(&m->m, FUTEX_WAIT | m->flags, 257, NULL, NULL, 0);
-	}
+// 	if (retval==0 && xchg_32(&c->bcast,0) == 1) {
+// 		int seq = c->seq;
+// 		retval = sys_futex(&c->seq, FUTEX_CMP_REQUEUE | c->flags, 0, (void *) INT_MAX, &m->m, seq);
+// 		// if (retval==-1) {
+// 		// 	perror("ERROR in cond_timedwait2: ");
+// 		// }
+// 		c->mid = -1;
+// 	}
+	
+// 	if (retval == -1 && errno == ETIMEDOUT)
+// 		retval = ETIMEDOUT;
 
-	if (xchg_32(&c->bcast,0) == 1) {
-		int seq = c->seq;
-		sys_futex(&c->seq, FUTEX_CMP_REQUEUE | c->flags, 0, (void *) INT_MAX, &m->m, seq);
-		c->mid = -1;
-	}
-
-	return retval;
-}
+// 	return retval;
+// }
 
 #else
+
+#define mutex_init mutex_init_v1
+#define mutex_destroy mutex_destroy_v1
+
+
+#define cond_init cond_init_v1
+#define cond_destroy cond_destroy_v1
 
 static inline int mutex_lock(mutex_t *m)
 {
